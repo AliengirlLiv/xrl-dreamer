@@ -6,6 +6,7 @@ import os
 import pathlib
 import sys
 import time
+import shutil
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['MUJOCO_GL'] = 'egl'
@@ -83,21 +84,24 @@ def define_config():
 
   config.adversarial = False
   config.dream_only = False
-  config.initial_buffer_count = 5000
+  config.initial_buffer_count = 500
+  config.train_every = 1
+  config.steps = 1000
 
   # DEBUG
-  config.prefill = 7
-  config.steps = 1005
-  config.deter_size = 2
-  config.stoch_size = 3
-  config.num_units = 4
-  config.cnn_depth = 2
-  config.eval_every = 2
-  config.log_every = 1
-  config.train_every = 3
-  config.pretrain = 3
-  config.train_steps = 5
-  config.time_limit = 999
+  # config.prefill = 7
+  # config.steps = 10000
+  # config.deter_size = 2
+  # config.stoch_size = 3
+  # config.num_units = 4
+  # config.cnn_depth = 2
+  # config.eval_every = 2
+  # config.log_every = 1
+  # config.train_every = 3
+  # config.pretrain = 3
+  # config.train_steps = 5
+  # config.time_limit = 50
+  # config.batch_length = 25
 
   return config
 
@@ -173,6 +177,7 @@ class Dreamer(tools.Module):
   def train(self, data, log_images=False):
     self._strategy.experimental_run_v2(self._train, args=(data, log_images))
 
+  # @tf.function()
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
       embed = self._encode(data)
@@ -196,6 +201,8 @@ class Dreamer(tools.Module):
         div = tf.maximum(div, self._c.free_nats)
         model_loss = self._c.kl_scale * div - sum(likes.values())
         model_loss /= float(self._strategy.num_replicas_in_sync)
+      else:
+        model_loss = tf.convert_to_tensor(0.0)
 
     with tf.GradientTape() as actor_tape:
       imag_feat = self._imagine_ahead(post)
@@ -430,6 +437,10 @@ def main(config):
   if config.precision == 16:
     prec.set_policy(prec.Policy('mixed_float16'))
   config.steps = int(config.steps)
+
+  if config.logdir.exists() and config.logdir.name == "debug":
+    shutil.rmtree(config.logdir)
+
   config.logdir.mkdir(parents=True, exist_ok=True)
   print('Logdir', config.logdir)
 
@@ -438,8 +449,10 @@ def main(config):
   writer = tf.summary.create_file_writer(
       str(config.logdir), max_queue=1000, flush_millis=20000)
   writer.set_as_default()
+  store_train = False if config.adversarial else True
   train_envs = [wrappers.Async(lambda: make_env(
-      config, writer, 'train', datadir, store=True), config.parallel)
+      config, writer, 'train', datadir,
+    store=store_train), config.parallel)
       for _ in range(config.envs)]
   test_envs = [wrappers.Async(lambda: make_env(
       config, writer, 'test', datadir, store=False), config.parallel)
