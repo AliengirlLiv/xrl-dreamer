@@ -28,11 +28,11 @@ import wrappers
 def define_config():
   config = tools.AttrDict()
   # General.
-  config.logdir = pathlib.Path('.')
+  config.logdir = pathlib.Path('results/temp')
   config.seed = 0
   config.steps = 5e6
   config.eval_every = 1e4
-  config.log_every = 1e3
+  config.log_every = 50
   config.log_scalars = True
   config.log_images = True
   config.gpu_growth = True
@@ -62,7 +62,7 @@ def define_config():
   # Training.
   config.batch_size = 50
   config.batch_length = 50
-  config.train_every = 1000
+  config.train_every = 10#00
   config.train_steps = 100
   config.pretrain = 100
   config.model_lr = 6e-4
@@ -80,6 +80,25 @@ def define_config():
   config.expl_amount = 0.3
   config.expl_decay = 0.0
   config.expl_min = 0.0
+
+  config.adversarial = False
+  config.dream_only = False
+  config.initial_buffer_count = 5000
+
+  # DEBUG
+  config.prefill = 7
+  config.steps = 1005
+  config.deter_size = 2
+  config.stoch_size = 3
+  config.num_units = 4
+  config.cnn_depth = 2
+  config.eval_every = 2
+  config.log_every = 1
+  config.train_every = 3
+  config.pretrain = 3
+  config.train_steps = 5
+  config.time_limit = 999
+
   return config
 
 
@@ -157,24 +176,26 @@ class Dreamer(tools.Module):
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
       embed = self._encode(data)
-      post, prior = self._dynamics.observe(embed, data['action'])
-      feat = self._dynamics.get_feat(post)
-      image_pred = self._decode(feat)
-      reward_pred = self._reward(feat)
-      likes = tools.AttrDict()
-      likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
-      likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
-      if self._c.pcont:
-        pcont_pred = self._pcont(feat)
-        pcont_target = self._c.discount * data['discount']
-        likes.pcont = tf.reduce_mean(pcont_pred.log_prob(pcont_target))
-        likes.pcont *= self._c.pcont_scale
-      prior_dist = self._dynamics.get_dist(prior)
-      post_dist = self._dynamics.get_dist(post)
-      div = tf.reduce_mean(tfd.kl_divergence(post_dist, prior_dist))
-      div = tf.maximum(div, self._c.free_nats)
-      model_loss = self._c.kl_scale * div - sum(likes.values())
-      model_loss /= float(self._strategy.num_replicas_in_sync)
+
+      if not self._c.dream_only:
+        post, prior = self._dynamics.observe(embed, data['action'])
+        feat = self._dynamics.get_feat(post)
+        image_pred = self._decode(feat)
+        reward_pred = self._reward(feat)
+        likes = tools.AttrDict()
+        likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
+        likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
+        if self._c.pcont:
+          pcont_pred = self._pcont(feat)
+          pcont_target = self._c.discount * data['discount']
+          likes.pcont = tf.reduce_mean(pcont_pred.log_prob(pcont_target))
+          likes.pcont *= self._c.pcont_scale
+        prior_dist = self._dynamics.get_dist(prior)
+        post_dist = self._dynamics.get_dist(post)
+        div = tf.reduce_mean(tfd.kl_divergence(post_dist, prior_dist))
+        div = tf.maximum(div, self._c.free_nats)
+        model_loss = self._c.kl_scale * div - sum(likes.values())
+        model_loss /= float(self._strategy.num_replicas_in_sync)
 
     with tf.GradientTape() as actor_tape:
       imag_feat = self._imagine_ahead(post)
@@ -187,6 +208,10 @@ class Dreamer(tools.Module):
       returns = tools.lambda_return(
           reward[:-1], value[:-1], pcont[:-1],
           bootstrap=value[-1], lambda_=self._c.disclam, axis=0)
+
+      if self._c.adversarial:
+        returns = - returns
+
       discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
           [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
       actor_loss = -tf.reduce_mean(discount * returns)
@@ -422,8 +447,11 @@ def main(config):
   actspace = train_envs[0].action_space
 
   # Prefill dataset with random episodes.
-  step = count_steps(datadir, config)
-  prefill = max(0, config.prefill - step)
+  if config.initial_buffer_count:
+    prefill = int(config.initial_buffer_count)
+  else:
+    step = count_steps(datadir, config)
+    prefill = max(0, config.prefill - step)
   print(f'Prefill dataset with {prefill} steps.')
   random_agent = lambda o, d, _: ([actspace.sample() for _ in d], None)
   tools.simulate(random_agent, train_envs, prefill / config.action_repeat)
