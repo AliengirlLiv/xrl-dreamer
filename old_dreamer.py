@@ -7,7 +7,6 @@ import os
 import pathlib
 import sys
 import time
-import shutil
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['MUJOCO_GL'] = 'egl'
@@ -38,13 +37,13 @@ def define_config():
   config.log_scalars = True
   config.log_images = True
   config.gpu_growth = True
-  config.precision = 16
+  config.precision = 32
   # Environment.
   config.task = 'dmc_walker_walk'
   config.envs = 1
   config.parallel = 'none'
   config.action_repeat = 2
-  config.time_limit = 50#1000
+  config.time_limit = 1000
   config.prefill = 5000
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
@@ -62,14 +61,14 @@ def define_config():
   config.weight_decay = 0.0
   config.weight_decay_pattern = r'.*'
   # Training.
-  config.batch_size = 256 #50
-  config.batch_length = 25
-  config.train_every = 100
-  config.train_steps = 200
+  config.batch_size = 50
+  config.batch_length = 50
+  config.train_every = 1000
+  config.train_steps = 100
   config.pretrain = 100
   config.model_lr = 6e-4
-  config.value_lr = 1e-3 #8e-5
-  config.actor_lr = 1e-3 #8e-5
+  config.value_lr = 8e-5
+  config.actor_lr = 8e-5
   config.grad_clip = 100.0
   config.dataset_balance = False
   # Behavior.
@@ -82,44 +81,16 @@ def define_config():
   config.expl_amount = 0.3
   config.expl_decay = 0.0
   config.expl_min = 0.0
-  config.id = 'debug'
-  # HER
-  config.her = False
-  config.prob_future = 0.2
-  config.prob_env = 0.2
-
-  config.override_id = False
-
-
-
-  return config
-
-def config_debug(config):
-  # DEBUG
-  config.prefill = 7
-  config.steps = 1005
-  config.deter_size = 2
-  config.stoch_size = 3
-  config.num_units = 4
-  config.cnn_depth = 2
-  config.eval_every = 2
-  config.log_every = 1
-  config.train_every = 3
-  config.pretrain = 3
-  config.train_steps = 5
-  config.time_limit = 999
-
   return config
 
 
 class Dreamer(tools.Module):
 
-  def __init__(self, config, datadir, actspace, writer, env):
+  def __init__(self, config, datadir, actspace, writer):
     self._c = config
     self._actspace = actspace
     self._actdim = actspace.n if hasattr(actspace, 'n') else actspace.shape[0]
     self._writer = writer
-    self._env = env
     self._random = np.random.RandomState(config.seed)
     with tf.device('cpu:0'):
       self._step = tf.Variable(count_steps(datadir, config), dtype=tf.int64)
@@ -166,9 +137,6 @@ class Dreamer(tools.Module):
     else:
       latent, action = state
     embed = self._encode(preprocess(obs, self._c))
-    if 'state' in obs:
-      state = tf.dtypes.cast(obs['state'], embed.dtype)
-      embed = tf.concat([state, embed], axis=-1)
     latent, _ = self._dynamics.obs_step(latent, action, embed)
     feat = self._dynamics.get_feat(latent)
     if training:
@@ -183,78 +151,20 @@ class Dreamer(tools.Module):
     super().load(filename)
     self._should_pretrain()
 
-  def her_relabel(self, data):
-    """
-    Relabel a subset of a batch with new goals, sampled either randomly or from the future goals achieved
-    on the trajectory.
-    :param data: dictionary containing a batch of data
-    :return: (desired_goals, rewards), both shape (batch, horizon, vector_dimension)
-    """
-    achieved_goals = data["achieved_goal"]
-    desired_goals = data["desired_goal"]
-
-    orig_goals = desired_goals
-    batch, horizon, goal_len = desired_goals.shape
-    indices = tf.random.uniform(shape=(batch, horizon, 1), minval=0, maxval=1)  # Uniform [0-1]
-    future_goal_indices = tf.cast(indices < self._c.prob_future, tf.float32)
-    env_goal_indices = (1 - future_goal_indices) * tf.cast(indices < self._c.prob_future + self._c.prob_env, tf.float32)
-    # All other indices are the same as usual
-
-    # Sample some goals from the environment
-    env_goals = self._env.sample_goals(batch * horizon)
-    env_goals = tf.convert_to_tensor(np.reshape(env_goals, orig_goals.shape), dtype=tf.float32)
-    desired_goals = env_goals * env_goal_indices + desired_goals * (1 - env_goal_indices)
-
-    # Sample some goals from the trajectory future.
-    goals_list = []
-    for i in range(batch):  # TODO: consider ways to batch
-      for j in range(horizon):
-        future_index = np.random.randint(j, horizon)
-        future_goal = orig_goals[i, future_index]
-        goals_list.append(future_goal)
-
-    future_goals = tf.reshape(tf.stack(goals_list, axis=0), orig_goals.shape)
-    desired_goals = future_goals * future_goal_indices + desired_goals * (1 - future_goal_indices)
-
-    data['desired_goal'] = desired_goals
-
-    rewards = self._env.compute_rewards_tf(data)
-    return desired_goals, rewards
-
   @tf.function()
   def train(self, data, log_images=False):
     self._strategy.experimental_run_v2(self._train, args=(data, log_images))
 
-  # @tf.function()
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
-      if 'success' in data:
-        success_rate = tf.reduce_sum(data['success']) / data['success'].shape[1] # TODO: make this show up for a full run
-      else:
-        success_rate = tf.convert_to_tensor(np.array([-1]))
-      if self._c.her:
-        desired_goals, reward = self.her_relabel(data)
-        state = tf.concat([data["state"][:, :, :-3], desired_goals], axis=2)
-        assert reward.shape == data["reward"].shape, (reward.shape, data["reward"].shape)
-        assert state.shape == data["state"].shape, (state.shape, data["state"].shape)
-      else:
-        state = data["state"] if 'state' in data else None
-        reward = data["reward"]
-
-
       embed = self._encode(data)
-      if state is not None:
-        embed = tf.concat([state, embed], axis=-1)
       post, prior = self._dynamics.observe(embed, data['action'])
       feat = self._dynamics.get_feat(post)
-
-      likes = tools.AttrDict()
       image_pred = self._decode(feat)
-      likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
-
       reward_pred = self._reward(feat)
-      likes.reward = tf.reduce_mean(reward_pred.log_prob(reward))
-
+      likes = tools.AttrDict()
+      likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
+      likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
       if self._c.pcont:
         pcont_pred = self._pcont(feat)
         pcont_target = self._c.discount * data['discount']
@@ -298,7 +208,7 @@ class Dreamer(tools.Module):
         self._scalar_summaries(
             data, feat, prior_dist, post_dist, likes, div,
             model_loss, value_loss, actor_loss, model_norm, value_norm,
-            actor_norm, success_rate)
+            actor_norm)
       if tf.equal(log_images, True):
         self._image_summaries(data, embed, image_pred)
 
@@ -374,8 +284,7 @@ class Dreamer(tools.Module):
   def _scalar_summaries(
       self, data, feat, prior_dist, post_dist, likes, div,
       model_loss, value_loss, actor_loss, model_norm, value_norm,
-      actor_norm, success_rate):
-    self._metrics['success_rate'].update_state(success_rate)
+      actor_norm):
     self._metrics['model_grad_norm'].update_state(model_norm)
     self._metrics['value_grad_norm'].update_state(value_norm)
     self._metrics['actor_grad_norm'].update_state(actor_norm)
@@ -450,17 +359,11 @@ def summarize_episode(episode, config, datadir, writer, prefix):
   episodes, steps = tools.count_episodes(datadir)
   length = (len(episode['reward']) - 1) * config.action_repeat
   ret = episode['reward'].sum()
+  print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
   metrics = [
       (f'{prefix}/return', float(episode['reward'].sum())),
       (f'{prefix}/length', len(episode['reward']) - 1),
       (f'episodes', episodes)]
-  if 'success' in episode:
-    success = True in episode['success']
-    success_str = "succeeded" if success == 1 else "did not succeed"
-    print(f'{prefix.title()} episode of length {length} with return {ret:.1f}, which {success_str}.')
-    metrics.append((f'{prefix}/success', success))
-  else:
-    print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
   step = count_steps(datadir, config)
   with (config.logdir / 'metrics.jsonl').open('a') as f:
     f.write(json.dumps(dict([('step', step)] + metrics)) + '\n')
@@ -482,11 +385,6 @@ def make_env(config, writer, prefix, datadir, store):
         task, config.action_repeat, (64, 64), grayscale=False,
         life_done=True, sticky_actions=True)
     env = wrappers.OneHotAction(env)
-  elif suite == 'gym':
-    env = wrappers.GymControl(task)
-    env = wrappers.ActionRepeat(env, config.action_repeat)
-    env = wrappers.NormalizeActions(env)
-
   else:
     raise NotImplementedError(suite)
   env = wrappers.TimeLimit(env, config.time_limit / config.action_repeat)
@@ -535,7 +433,7 @@ def main(config):
   # Train and regularly evaluate the agent.
   step = count_steps(datadir, config)
   print(f'Simulating agent for {config.steps-step} steps.')
-  agent = Dreamer(config, datadir, actspace, writer, train_envs[0])
+  agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Load checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
@@ -563,15 +461,4 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser()
   for key, value in define_config().items():
     parser.add_argument(f'--{key}', type=tools.args_type(value), default=value)
-  config = parser.parse_args()
-
-  path = pathlib.Path('.').joinpath('logdir', config.task, 'dreamer', config.id)
-  # Raise an error if this ID is already used, unless we're in debug mode.
-  if path.exists():
-    if config.id == 'debug' or config.override_id:
-      config = config_debug(config)
-      shutil.rmtree(path)
-    else:
-      raise ValueError('ID %s already in use.' % config.id)
-  config.logdir = path
-  main(config)
+  main(parser.parse_args())
