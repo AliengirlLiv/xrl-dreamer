@@ -1,3 +1,5 @@
+Modification of the original Dream to Control codebase (https://github.com/google-research/dreamer) to add in interpretability. Work in progress.
+
 # Dream to Control
 
 Fast and simple implementation of the Dreamer agent in TensorFlow 2.
